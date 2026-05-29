@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
+import random
 import shutil
+import struct
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -8,13 +10,14 @@ DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "merged_dataset"
 
 RGB_FOLDER_NAME = "rgb"
-MASK_FOLDER_NAME = "mask"
-MASK_VISIB_FOLDER_NAME = "mask_visib"
-
 SCENE_GT_JSON_NAME = "scene_gt.json"
 SCENE_GT_INFO_JSON_NAME = "scene_gt_info.json"
-BBOX_CLASS_JSON_NAME = "scene_bbox_obj_class.json"
-VISIB_FRACT_JSON_NAME = "scene_visib_fract.json"
+
+TRAIN_FRACTION = 0.70
+VAL_FRACTION = 0.15
+TEST_FRACTION = 0.15
+SHUFFLE = True
+SEED = 42
 
 
 def get_source_dirs(data_dir: Path):
@@ -26,14 +29,6 @@ def get_source_dirs(data_dir: Path):
         p for p in data_dir.iterdir()
         if p.is_dir() and (p / RGB_FOLDER_NAME).exists()
     )
-
-
-
-def make_image_dirs(output_dir: Path):
-    (output_dir / "rgb").mkdir(parents=True, exist_ok=True)
-    (output_dir / "mask").mkdir(parents=True, exist_ok=True)
-    (output_dir / "mask_visi").mkdir(parents=True, exist_ok=True)
-
 
 
 def load_json_dict(json_path: Path):
@@ -51,7 +46,6 @@ def load_json_dict(json_path: Path):
     return data
 
 
-
 def get_json_entry_by_image_id(json_dict, old_image_id: str):
     if old_image_id in json_dict:
         return json_dict[old_image_id]
@@ -63,197 +57,261 @@ def get_json_entry_by_image_id(json_dict, old_image_id: str):
     return None
 
 
-
-def copy_matching_masks(
-    source_mask_dir: Path,
-    output_mask_dir: Path,
-    old_image_id: str,
-    new_image_id: str,
-):
-
-    if not source_mask_dir.exists():
-        print(f"Missing mask folder: {source_mask_dir}")
-        return
-
-    pattern = f"{old_image_id}_*"
-
-    for mask_path in sorted(source_mask_dir.glob(pattern)):
-        object_id = mask_path.stem.split("_")[1]
-        new_mask_name = f"{new_image_id}_{object_id}{mask_path.suffix}"
-
-        target_path = output_mask_dir / new_mask_name
-        shutil.copy2(mask_path, target_path)
+def make_yolo_dirs(output_dir: Path):
+    for split in ("train", "val", "test"):
+        (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+        (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
 
-
-def build_bbox_and_visibility_json(merged_scene_gt: dict, merged_scene_gt_info: dict):
-    bbox_class_data = {}
-    visib_fract_data = {}
-
-    all_scene_keys = sorted(
-        set(merged_scene_gt.keys()) | set(merged_scene_gt_info.keys()),
-        key=int,
-    )
-
-    for scene_key in all_scene_keys:
-        gt_objects = merged_scene_gt.get(scene_key, [])
-        gt_info_objects = merged_scene_gt_info.get(scene_key, [])
-
-        if len(gt_objects) != len(gt_info_objects):
-            print(
-                f"Warning: scene {scene_key} has different object counts "
-                f"(scene_gt={len(gt_objects)}, scene_gt_info={len(gt_info_objects)})."
-            )
-
-        object_count = min(len(gt_objects), len(gt_info_objects))
-
-        bbox_class_rows = []
-        visib_fract_rows = []
-
-        for obj_index in range(object_count):
-            gt_obj = gt_objects[obj_index]
-            gt_info_obj = gt_info_objects[obj_index]
-
-            bbox_class_rows.append(
-                {
-                    "obj_id": gt_obj.get("obj_id"),
-                    "bbox_obj": gt_info_obj.get("bbox_obj"),
-                }
-            )
-
-            visib_fract_rows.append(
-                {
-                    "obj_id": gt_obj.get("obj_id"),
-                    "visib_fract": gt_info_obj.get("visib_fract"),
-                }
-            )
-
-        bbox_class_data[scene_key] = bbox_class_rows
-        visib_fract_data[scene_key] = visib_fract_rows
-
-    return bbox_class_data, visib_fract_data
+def get_image_size(image_path: Path):
+    suffix = image_path.suffix.lower()
+    if suffix == ".png":
+        return get_png_size(image_path)
+    if suffix in {".jpg", ".jpeg"}:
+        return get_jpeg_size(image_path)
+    raise ValueError(f"Unsupported image format: {image_path}")
 
 
-def merge_images(source_dirs, output_dir: Path):
-    make_image_dirs(output_dir)
+def get_png_size(image_path: Path):
+    with image_path.open("rb") as f:
+        signature = f.read(8)
+        if signature != b"\x89PNG\r\n\x1a\n":
+            raise ValueError(f"Invalid PNG file: {image_path}")
+        ihdr_length = f.read(4)
+        ihdr_type = f.read(4)
+        if len(ihdr_length) < 4 or ihdr_type != b"IHDR":
+            raise ValueError(f"Invalid PNG IHDR: {image_path}")
+        ihdr_data = f.read(13)
+        if len(ihdr_data) < 13:
+            raise ValueError(f"Truncated PNG IHDR: {image_path}")
+        width, height = struct.unpack(">II", ihdr_data[:8])
+        return int(width), int(height)
 
-    global_image_index = 0
+
+def get_jpeg_size(image_path: Path):
+    with image_path.open("rb") as f:
+        if f.read(2) != b"\xff\xd8":
+            raise ValueError(f"Invalid JPEG file: {image_path}")
+
+        while True:
+            marker_start = f.read(1)
+            if not marker_start:
+                break
+
+            if marker_start != b"\xff":
+                continue
+
+            marker_code = f.read(1)
+            if not marker_code:
+                break
+
+            while marker_code == b"\xff":
+                marker_code = f.read(1)
+                if not marker_code:
+                    break
+
+            if marker_code in {b"\xd8", b"\xd9"}:
+                continue
+
+            segment_length_bytes = f.read(2)
+            if len(segment_length_bytes) != 2:
+                break
+            segment_length = struct.unpack(">H", segment_length_bytes)[0]
+            if segment_length < 2:
+                raise ValueError(f"Invalid JPEG segment length in {image_path}")
+
+            if marker_code in {
+                b"\xc0", b"\xc1", b"\xc2", b"\xc3",
+                b"\xc5", b"\xc6", b"\xc7",
+                b"\xc9", b"\xca", b"\xcb",
+                b"\xcd", b"\xce", b"\xcf",
+            }:
+                sof_data = f.read(segment_length - 2)
+                if len(sof_data) < 5:
+                    break
+                height, width = struct.unpack(">HH", sof_data[1:5])
+                return int(width), int(height)
+
+            f.seek(segment_length - 2, 1)
+
+    raise ValueError(f"Could not read JPEG size: {image_path}")
+
+
+def is_valid_bbox(bbox):
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return False
+
+    if any(not isinstance(v, (int, float)) for v in bbox):
+        return False
+
+    _, _, width, height = bbox
+    return width > 0 and height > 0
+
+
+def bbox_to_yolo(bbox, image_width: int, image_height: int):
+    x, y, width, height = bbox
+
+    x1 = max(0.0, float(x))
+    y1 = max(0.0, float(y))
+    x2 = min(float(image_width), float(x) + float(width))
+    y2 = min(float(image_height), float(y) + float(height))
+
+    clipped_width = x2 - x1
+    clipped_height = y2 - y1
+    if clipped_width <= 0 or clipped_height <= 0:
+        return None
+
+    x_center = (x1 + x2) / 2.0 / image_width
+    y_center = (y1 + y2) / 2.0 / image_height
+    norm_width = clipped_width / image_width
+    norm_height = clipped_height / image_height
+    return x_center, y_center, norm_width, norm_height
+
+
+def collect_records(source_dirs):
+    records = []
+    all_obj_ids = set()
 
     for source_dir in source_dirs:
-        print(f"\n[IMAGES] Processing folder: {source_dir}")
-
+        print(f"\n[COLLECT] Processing: {source_dir}")
         rgb_dir = source_dir / RGB_FOLDER_NAME
-        mask_dir = source_dir / MASK_FOLDER_NAME
-        mask_visib_dir = source_dir / MASK_VISIB_FOLDER_NAME
 
         if not rgb_dir.exists():
-            print(f"[IMAGES] Skipped, missing rgb folder: {rgb_dir}")
+            print(f"[COLLECT] Skipped, missing rgb folder: {rgb_dir}")
             continue
 
-        rgb_files = sorted(rgb_dir.glob("*.*"))
-
-        for rgb_path in rgb_files:
-            old_image_id = rgb_path.stem
-            new_image_id = f"{global_image_index:06d}"
-
-            new_rgb_name = f"{new_image_id}{rgb_path.suffix}"
-            target_rgb_path = output_dir / "rgb" / new_rgb_name
-            shutil.copy2(rgb_path, target_rgb_path)
-
-            copy_matching_masks(
-                source_mask_dir=mask_dir,
-                output_mask_dir=output_dir / "mask",
-                old_image_id=old_image_id,
-                new_image_id=new_image_id,
-            )
-
-            copy_matching_masks(
-                source_mask_dir=mask_visib_dir,
-                output_mask_dir=output_dir / "mask_visi",
-                old_image_id=old_image_id,
-                new_image_id=new_image_id,
-            )
-
-            global_image_index += 1
-
-    print(f"\n[IMAGES] Done. Copied RGB images: {global_image_index}")
-    print(f"[IMAGES] Output saved to: {output_dir}")
-
-
-
-def merge_json(source_dirs, output_dir: Path):
-    merged_scene_gt = {}
-    merged_scene_gt_info = {}
-    global_image_index = 0
-
-    for source_dir in source_dirs:
-        print(f"\n[JSON] Processing folder: {source_dir}")
-
-        rgb_dir = source_dir / RGB_FOLDER_NAME
         scene_gt = load_json_dict(source_dir / SCENE_GT_JSON_NAME)
         scene_gt_info = load_json_dict(source_dir / SCENE_GT_INFO_JSON_NAME)
-
-        if not rgb_dir.exists():
-            print(f"[JSON] Skipped, missing rgb folder: {rgb_dir}")
-            continue
-
         rgb_files = sorted(rgb_dir.glob("*.*"))
 
         for rgb_path in rgb_files:
             old_image_id = rgb_path.stem
-            new_json_key = str(global_image_index)
+            gt_entry = get_json_entry_by_image_id(scene_gt, old_image_id) or []
+            gt_info_entry = get_json_entry_by_image_id(scene_gt_info, old_image_id) or []
 
-            gt_entry = get_json_entry_by_image_id(scene_gt, old_image_id)
-            gt_info_entry = get_json_entry_by_image_id(scene_gt_info, old_image_id)
-
-            if gt_entry is not None:
-                merged_scene_gt[new_json_key] = gt_entry
-            else:
-                print(f"Warning: no {SCENE_GT_JSON_NAME} entry for image ID {old_image_id} in {source_dir}")
-
-            if gt_info_entry is not None:
-                merged_scene_gt_info[new_json_key] = gt_info_entry
-            else:
+            if len(gt_entry) != len(gt_info_entry):
                 print(
-                    f"Warning: no {SCENE_GT_INFO_JSON_NAME} entry for image ID {old_image_id} in {source_dir}"
+                    f"[COLLECT] Warning: {source_dir.name}/{old_image_id} has different object counts "
+                    f"(scene_gt={len(gt_entry)}, scene_gt_info={len(gt_info_entry)})."
                 )
 
-            global_image_index += 1
+            for gt_obj in gt_entry:
+                obj_id = gt_obj.get("obj_id")
+                if obj_id is not None:
+                    all_obj_ids.add(int(obj_id))
 
-    with (output_dir / SCENE_GT_JSON_NAME).open("w", encoding="utf-8") as f:
-        json.dump(merged_scene_gt, f)
+            image_width, image_height = get_image_size(rgb_path)
+            records.append(
+                {
+                    "rgb_path": rgb_path,
+                    "gt": gt_entry,
+                    "gt_info": gt_info_entry,
+                    "image_width": image_width,
+                    "image_height": image_height,
+                }
+            )
 
-    with (output_dir / SCENE_GT_INFO_JSON_NAME).open("w", encoding="utf-8") as f:
-        json.dump(merged_scene_gt_info, f)
-
-    print(f"\n[JSON] Done. Merged {SCENE_GT_JSON_NAME} entries: {len(merged_scene_gt)}")
-    print(f"[JSON] Merged {SCENE_GT_INFO_JSON_NAME} entries: {len(merged_scene_gt_info)}")
-    print(f"[JSON] Output saved to: {output_dir}")
+    return records, sorted(all_obj_ids)
 
 
+def assign_split(index: int, train_end: int, val_end: int):
+    if index < train_end:
+        return "train"
+    if index < val_end:
+        return "val"
+    return "test"
 
-def create_derived_json(output_dir: Path):
-    merged_scene_gt = load_json_dict(output_dir / SCENE_GT_JSON_NAME)
-    merged_scene_gt_info = load_json_dict(output_dir / SCENE_GT_INFO_JSON_NAME)
 
-    bbox_class_data, visib_fract_data = build_bbox_and_visibility_json(
-        merged_scene_gt,
-        merged_scene_gt_info,
-    )
+def write_data_yaml(output_dir: Path, class_ids):
+    class_names = [f"obj_{obj_id}" for obj_id in class_ids]
 
-    with (output_dir / BBOX_CLASS_JSON_NAME).open("w", encoding="utf-8") as f:
-        json.dump(bbox_class_data, f)
+    lines = [
+        "path: .",
+        "train: images/train",
+        "val: images/val",
+        "test: images/test",
+        f"nc: {len(class_names)}",
+        f"names: {class_names}",
+    ]
 
-    with (output_dir / VISIB_FRACT_JSON_NAME).open("w", encoding="utf-8") as f:
-        json.dump(visib_fract_data, f)
+    (output_dir / "data.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    print(f"\n[DERIVED] Done. Created {BBOX_CLASS_JSON_NAME} entries: {len(bbox_class_data)}")
-    print(f"[DERIVED] Created {VISIB_FRACT_JSON_NAME} entries: {len(visib_fract_data)}")
-    print(f"[DERIVED] Output saved to: {output_dir}")
+
+def merge_to_yolo(source_dirs, output_dir: Path):
+    if abs((TRAIN_FRACTION + VAL_FRACTION + TEST_FRACTION) - 1.0) > 1e-9:
+        raise ValueError("TRAIN_FRACTION + VAL_FRACTION + TEST_FRACTION must be 1.0")
+
+    make_yolo_dirs(output_dir)
+
+    records, class_ids = collect_records(source_dirs)
+    if not records:
+        print("No input images found. Nothing to merge.")
+        return
+
+    class_to_idx = {obj_id: idx for idx, obj_id in enumerate(class_ids)}
+
+    if SHUFFLE:
+        random.Random(SEED).shuffle(records)
+
+    total = len(records)
+    train_end = int(total * TRAIN_FRACTION)
+    val_end = train_end + int(total * VAL_FRACTION)
+
+    copied_images = 0
+    written_labels = 0
+    skipped_boxes = 0
+
+    for index, record in enumerate(records):
+        split = assign_split(index, train_end, val_end)
+        new_image_id = f"{index:06d}"
+        source_image_path = record["rgb_path"]
+        image_suffix = source_image_path.suffix.lower()
+
+        target_image_path = output_dir / "images" / split / f"{new_image_id}{image_suffix}"
+        shutil.copy2(source_image_path, target_image_path)
+        copied_images += 1
+
+        label_lines = []
+        gt_objects = record["gt"]
+        info_objects = record["gt_info"]
+        image_width = record["image_width"]
+        image_height = record["image_height"]
+
+        for gt_obj, info_obj in zip(gt_objects, info_objects):
+            obj_id = gt_obj.get("obj_id")
+            bbox = info_obj.get("bbox_obj")
+
+            if obj_id is None or not is_valid_bbox(bbox):
+                skipped_boxes += 1
+                continue
+
+            yolo_box = bbox_to_yolo(bbox, image_width, image_height)
+            if yolo_box is None:
+                skipped_boxes += 1
+                continue
+
+            class_idx = class_to_idx[int(obj_id)]
+            x_center, y_center, width, height = yolo_box
+            label_lines.append(
+                f"{class_idx} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+            )
+
+        label_path = output_dir / "labels" / split / f"{new_image_id}.txt"
+        label_text = "\n".join(label_lines)
+        if label_text:
+            label_text += "\n"
+        label_path.write_text(label_text, encoding="utf-8")
+        written_labels += 1
+
+    write_data_yaml(output_dir, class_ids)
+
+    print(f"\n[DONE] Output directory: {output_dir}")
+    print(f"[DONE] Images copied: {copied_images}")
+    print(f"[DONE] Label files written: {written_labels}")
+    print(f"[DONE] Classes (obj_id -> class_idx): {class_to_idx}")
+    print(f"[DONE] Skipped invalid/clipped-out boxes: {skipped_boxes}")
 
 
 if __name__ == "__main__":
     source_dirs = get_source_dirs(DATA_DIR)
-    merge_images(source_dirs, OUTPUT_DIR)
-    merge_json(source_dirs, OUTPUT_DIR)
-    create_derived_json(OUTPUT_DIR)
+    merge_to_yolo(source_dirs, OUTPUT_DIR)
