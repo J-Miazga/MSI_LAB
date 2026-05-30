@@ -57,18 +57,10 @@ def get_json_entry_by_image_id(json_dict, old_image_id: str):
     return None
 
 
-def make_yolo_dirs(output_dir: Path):
-    for split in ("train", "val", "test"):
-        (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
-        (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
-
-
 def get_image_size(image_path: Path):
     suffix = image_path.suffix.lower()
     if suffix == ".png":
         return get_png_size(image_path)
-    if suffix in {".jpg", ".jpeg"}:
-        return get_jpeg_size(image_path)
     raise ValueError(f"Unsupported image format: {image_path}")
 
 
@@ -86,55 +78,6 @@ def get_png_size(image_path: Path):
             raise ValueError(f"Truncated PNG IHDR: {image_path}")
         width, height = struct.unpack(">II", ihdr_data[:8])
         return int(width), int(height)
-
-
-def get_jpeg_size(image_path: Path):
-    with image_path.open("rb") as f:
-        if f.read(2) != b"\xff\xd8":
-            raise ValueError(f"Invalid JPEG file: {image_path}")
-
-        while True:
-            marker_start = f.read(1)
-            if not marker_start:
-                break
-
-            if marker_start != b"\xff":
-                continue
-
-            marker_code = f.read(1)
-            if not marker_code:
-                break
-
-            while marker_code == b"\xff":
-                marker_code = f.read(1)
-                if not marker_code:
-                    break
-
-            if marker_code in {b"\xd8", b"\xd9"}:
-                continue
-
-            segment_length_bytes = f.read(2)
-            if len(segment_length_bytes) != 2:
-                break
-            segment_length = struct.unpack(">H", segment_length_bytes)[0]
-            if segment_length < 2:
-                raise ValueError(f"Invalid JPEG segment length in {image_path}")
-
-            if marker_code in {
-                b"\xc0", b"\xc1", b"\xc2", b"\xc3",
-                b"\xc5", b"\xc6", b"\xc7",
-                b"\xc9", b"\xca", b"\xcb",
-                b"\xcd", b"\xce", b"\xcf",
-            }:
-                sof_data = f.read(segment_length - 2)
-                if len(sof_data) < 5:
-                    break
-                height, width = struct.unpack(">HH", sof_data[1:5])
-                return int(width), int(height)
-
-            f.seek(segment_length - 2, 1)
-
-    raise ValueError(f"Could not read JPEG size: {image_path}")
 
 
 def is_valid_bbox(bbox):
@@ -221,27 +164,15 @@ def assign_split(index: int, train_end: int, val_end: int):
         return "val"
     return "test"
 
-
-def write_data_yaml(output_dir: Path, class_ids):
-    class_names = [f"obj_{obj_id}" for obj_id in class_ids]
-
-    lines = [
-        "path: .",
-        "train: images/train",
-        "val: images/val",
-        "test: images/test",
-        f"nc: {len(class_names)}",
-        f"names: {class_names}",
-    ]
-
-    (output_dir / "data.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def merge_to_yolo(source_dirs, output_dir: Path):
     if abs((TRAIN_FRACTION + VAL_FRACTION + TEST_FRACTION) - 1.0) > 1e-9:
         raise ValueError("TRAIN_FRACTION + VAL_FRACTION + TEST_FRACTION must be 1.0")
 
-    make_yolo_dirs(output_dir)
+    rgb_output_dir = output_dir / "rgb"
+    labels_output_dir = output_dir / "labels"
+
+    rgb_output_dir.mkdir(parents=True, exist_ok=True)
+    labels_output_dir.mkdir(parents=True, exist_ok=True)
 
     records, class_ids = collect_records(source_dirs)
     if not records:
@@ -261,23 +192,37 @@ def merge_to_yolo(source_dirs, output_dir: Path):
     written_labels = 0
     skipped_boxes = 0
 
+    split_info = {
+        "train": [],
+        "val": [],
+        "test": [],
+    }
+
     for index, record in enumerate(records):
         split = assign_split(index, train_end, val_end)
+
         new_image_id = f"{index:06d}"
+
         source_image_path = record["rgb_path"]
         image_suffix = source_image_path.suffix.lower()
 
-        target_image_path = output_dir / "images" / split / f"{new_image_id}{image_suffix}"
+        target_image_path = rgb_output_dir / f"{new_image_id}{image_suffix}"
+
         shutil.copy2(source_image_path, target_image_path)
         copied_images += 1
 
+        split_info[split].append(new_image_id)
+
         label_lines = []
+
         gt_objects = record["gt"]
         info_objects = record["gt_info"]
+
         image_width = record["image_width"]
         image_height = record["image_height"]
 
         for gt_obj, info_obj in zip(gt_objects, info_objects):
+
             obj_id = gt_obj.get("obj_id")
             bbox = info_obj.get("bbox_obj")
 
@@ -286,30 +231,50 @@ def merge_to_yolo(source_dirs, output_dir: Path):
                 continue
 
             yolo_box = bbox_to_yolo(bbox, image_width, image_height)
+
             if yolo_box is None:
                 skipped_boxes += 1
                 continue
 
             class_idx = class_to_idx[int(obj_id)]
+
             x_center, y_center, width, height = yolo_box
+
             label_lines.append(
-                f"{class_idx} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+                f"{class_idx} "
+                f"{x_center:.6f} "
+                f"{y_center:.6f} "
+                f"{width:.6f} "
+                f"{height:.6f}"
             )
 
-        label_path = output_dir / "labels" / split / f"{new_image_id}.txt"
+        label_path = labels_output_dir / f"{new_image_id}.txt"
+
         label_text = "\n".join(label_lines)
+
         if label_text:
             label_text += "\n"
+
         label_path.write_text(label_text, encoding="utf-8")
+
         written_labels += 1
 
-    write_data_yaml(output_dir, class_ids)
+    split_info_path = output_dir / "split_info.json"
+
+    with split_info_path.open("w", encoding="utf-8") as f:
+        json.dump(split_info, f, indent=2)
+
+    class_mapping_path = output_dir / "class_mapping.json"
+
+    with class_mapping_path.open("w", encoding="utf-8") as f:
+        json.dump(class_to_idx, f, indent=2)
 
     print(f"\n[DONE] Output directory: {output_dir}")
     print(f"[DONE] Images copied: {copied_images}")
     print(f"[DONE] Label files written: {written_labels}")
     print(f"[DONE] Classes (obj_id -> class_idx): {class_to_idx}")
     print(f"[DONE] Skipped invalid/clipped-out boxes: {skipped_boxes}")
+    print(f"[DONE] Saved split info: {split_info_path}")
 
 
 if __name__ == "__main__":
